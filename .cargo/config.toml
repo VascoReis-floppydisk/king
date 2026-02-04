@@ -2,8 +2,8 @@
 target = "i686-king.json"
 
 [unstable]
-# Use underscores here to satisfy the package ID requirement
-build-std = ["core", "compiler_builtins"]
+# Add "alloc" to the list below
+build-std = ["core", "compiler_builtins", "alloc"]
 build-std-features = ["compiler-builtins-mem"]
 
 [target.'targetjson(i686-king.json)']
