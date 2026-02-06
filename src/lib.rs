@@ -1,11 +1,20 @@
 #![no_std]
 #![no_main]
+#![feature(alloc_error_handler)]
+
+extern crate alloc;
+static mut COMMAND_READY: bool = false;
+static mut DISK_TRANSFER_BUFFER: [u16; 256] = [0; 256];
 
 use core::arch::{asm, naked_asm};
 use core::panic::PanicInfo;
+use core::ptr::{addr_of, addr_of_mut};
+use core::alloc::{GlobalAlloc, Layout};
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 const DEFAULT_COLOR: u16 = 0x0F00;
-const DIR_SECTOR: u32 = 2048; 
+const DIR_SECTOR: u32 = 2048;
+static mut IN_KWRITE_MODE: bool = false;
 
 // ATA Ports
 const ATA_DATA: u16 = 0x1F0;
@@ -17,8 +26,40 @@ const ATA_DRIVE_SELECT: u16 = 0x1F6;
 const ATA_COMMAND: u16 = 0x1F7;
 const ATA_CONTROL: u16 = 0x3F6;
 
-// --- STRUCTURES ---
+// --- GLOBAL ALLOCATOR ---
+struct KingAllocator {
+    heap_start: usize,
+    heap_end: usize,
+    next: AtomicUsize,
+}
 
+unsafe impl GlobalAlloc for KingAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let start = self.next.load(Ordering::Relaxed);
+        let align = layout.align();
+        let alloc_start = (start + align - 1) & !(align - 1);
+        let alloc_end = alloc_start + layout.size();
+        if alloc_end <= self.heap_end {
+            self.next.store(alloc_end, Ordering::Relaxed);
+            alloc_start as *mut u8
+        } else {
+            core::ptr::null_mut()
+        }
+    }
+    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {}
+}
+
+#[global_allocator]
+static ALLOCATOR: KingAllocator = KingAllocator {
+    heap_start: 0x100000,
+    heap_end: 0x400000,
+    next: AtomicUsize::new(0x100000),
+};
+
+#[alloc_error_handler]
+fn alloc_error(_layout: Layout) -> ! { loop {} }
+
+// --- STRUCTURES ---
 #[repr(C, packed)]
 #[derive(Copy, Clone)]
 struct FileEntry {
@@ -40,13 +81,12 @@ static mut CURSOR_Y: isize = 1;
 static mut COMMAND_BUFFER: [u8; 64] = [0; 64];
 static mut COMMAND_LEN: usize = 0;
 static mut TICKS: u32 = 0;
-static mut DISK_TRANSFER_BUFFER: [u16; 256] = [0; 256];
+static mut DIR_BUFFER: [u8; 512] = [0; 512];
 static mut IDT: [IdtEntry; 256] = [IdtEntry { low: 0, sel: 0, res: 0, flags: 0, high: 0 }; 256];
 
 // --- DISK DRIVER (HARDENED) ---
 
 unsafe fn io_wait() {
-    // Standard 400ns delay via reading the control register
     for _ in 0..4 { asm!("in al, dx", out("al") _, in("dx") ATA_CONTROL); }
 }
 
@@ -58,57 +98,75 @@ unsafe fn wait_for_not_busy() {
     }
 }
 
+unsafe fn wait_for_ready() -> bool {
+    let mut timeout = 100000;
+    while timeout > 0 {
+        let status: u8;
+        asm!("in al, dx", out("al") status, in("dx") ATA_COMMAND);
+        if (status & 0x01) != 0 { return false; }
+        if (status & 0x80) == 0 && (status & 0x40) != 0 { return true; }
+        timeout -= 1;
+    }
+    false
+}
+
+unsafe fn select_drive(lba: u32) {
+    let drive_sel = 0xE0 | ((lba >> 24) & 0x0F) as u8;
+    asm!("out dx, al", in("dx") ATA_DRIVE_SELECT, in("al") drive_sel);
+    io_wait();
+    wait_for_ready();
+}
+
 unsafe fn wait_for_drq() -> bool {
     let mut timeout = 100000;
     while timeout > 0 {
         let status: u8;
         asm!("in al, dx", out("al") status, in("dx") ATA_COMMAND);
         if (status & 0x08) != 0 { return true; }
-        if (status & 0x01) != 0 { return false; } // Error bit
+        if (status & 0x01) != 0 { return false; }
         timeout -= 1;
     }
     false
 }
 
 unsafe fn write_sector(lba: u32, buffer: *const u16) {
-    wait_for_not_busy();
-    asm!("out dx, al", in("dx") ATA_DRIVE_SELECT, in("al") (0xE0 | ((lba >> 24) & 0x0F)) as u8);
-    io_wait();
+    select_drive(lba);
     asm!("out dx, al", in("dx") ATA_SECTOR_COUNT, in("al") 1u8);
     asm!("out dx, al", in("dx") ATA_LBA_LOW, in("al") (lba & 0xFF) as u8);
     asm!("out dx, al", in("dx") ATA_LBA_MID, in("al") ((lba >> 8) & 0xFF) as u8);
     asm!("out dx, al", in("dx") ATA_LBA_HIGH, in("al") ((lba >> 16) & 0xFF) as u8);
     asm!("out dx, al", in("dx") ATA_COMMAND, in("al") 0x30u8); 
 
+    io_wait();
     if wait_for_drq() {
         for i in 0..256 {
-            asm!("out dx, ax", in("dx") ATA_DATA, in("ax") *buffer.offset(i));
+            let word = core::ptr::read_volatile(buffer.offset(i as isize));
+            asm!("out dx, ax", in("dx") ATA_DATA, in("ax") word);
         }
+        wait_for_not_busy();
+        asm!("out dx, al", in("dx") ATA_COMMAND, in("al") 0xE7u8); // FLUSH CACHE
+        wait_for_not_busy(); 
     }
-    
-    asm!("out dx, al", in("dx") ATA_COMMAND, in("al") 0xE7u8); // Cache Flush
-    wait_for_not_busy();
 }
 
 unsafe fn read_sector(lba: u32, buffer: *mut u16) {
-    wait_for_not_busy();
-    asm!("out dx, al", in("dx") ATA_DRIVE_SELECT, in("al") (0xE0 | ((lba >> 24) & 0x0F)) as u8);
-    io_wait();
+    select_drive(lba);
     asm!("out dx, al", in("dx") ATA_SECTOR_COUNT, in("al") 1u8);
     asm!("out dx, al", in("dx") ATA_LBA_LOW, in("al") (lba & 0xFF) as u8);
     asm!("out dx, al", in("dx") ATA_LBA_MID, in("al") ((lba >> 8) & 0xFF) as u8);
     asm!("out dx, al", in("dx") ATA_LBA_HIGH, in("al") ((lba >> 16) & 0xFF) as u8);
     asm!("out dx, al", in("dx") ATA_COMMAND, in("al") 0x20u8); 
-
+    io_wait();
     if wait_for_drq() {
         for i in 0..256 {
-            asm!("in ax, dx", out("ax") *buffer.offset(i), in("dx") ATA_DATA);
+            let mut word: u16;
+            asm!("in ax, dx", out("ax") word, in("dx") ATA_DATA);
+            core::ptr::write_volatile(buffer.offset(i as isize), word);
         }
     }
 }
 
 // --- UTILITIES ---
-
 unsafe fn putchar_attr(c: u8, attr: u16) {
     let vga = 0xb8000 as *mut u16;
     if c == b'\n' { CURSOR_X = 0; CURSOR_Y += 1; }
@@ -126,7 +184,6 @@ unsafe fn putchar_attr(c: u8, attr: u16) {
 unsafe fn putchar(c: u8) { putchar_attr(c, DEFAULT_COLOR); }
 unsafe fn print_str(s: &[u8]) { for &b in s { if b != 0 { putchar(b); } } }
 unsafe fn print_color(s: &[u8], attr: u16) { for &b in s { putchar_attr(b, attr); } }
-
 unsafe fn print_num(mut n: u32, attr: u16) {
     if n == 0 { putchar_attr(b'0', attr); return; }
     let mut buf = [0u8; 10]; let mut i = 10;
@@ -158,13 +215,12 @@ unsafe fn str_eq(buf: &[u8], cmd: &[u8]) -> bool {
 }
 
 // --- FETCH ---
-
 unsafe fn fetch() {
     let crown_clr = 0x0E00; let label_clr = 0x0B00; let value_clr = 0x0F00;
     print_color(b"          o          ", crown_clr);
-    print_color(b"  OS:     ", label_clr); print_color(b"King OS v0.7.5\n", value_clr);
+    print_color(b"  OS:     ", label_clr); print_color(b"King OS v0.0.1\n", value_clr);
     print_color(b"       o^/|\\^o       ", crown_clr);
-    print_color(b"  DISK:   ", label_clr); print_color(b"ATA LBA-2048\n", value_clr);
+    print_color(b"  DISK:   ", label_clr); print_color(b"ATA LBA-PIO\n", value_clr);
     print_color(b"    o_^|\\/*\\/|^_o    ", crown_clr);
     print_color(b"  UPTIME: ", label_clr); print_num(TICKS / 100, value_clr); print_color(b"s\n", value_clr);
     print_color(b"   o\\*`'.\\|/.'`*/o   ", crown_clr);
@@ -175,69 +231,156 @@ unsafe fn fetch() {
     print_color(b"     `\"\"\"\"\"\"\"\"\"`     ", crown_clr); putchar(b'\n');
 }
 
-// --- COMMAND LOGIC ---
-
 unsafe fn execute_command() {
     let cmd = &COMMAND_BUFFER[..COMMAND_LEN];
-    if COMMAND_LEN == 0 { return; }
+    let in_kwrite = core::ptr::read_volatile(addr_of!(IN_KWRITE_MODE));
 
-    if str_eq(cmd, b"FETCH") {
-        fetch();
-    } else if str_eq(cmd, b"HELP") {
-        print_str(b"FETCH, LS, TOUCH, FORMAT, CLEAR, REBOOT\n");
-    } else if str_eq(cmd, b"FORMAT") {
-        for i in 0..256 { DISK_TRANSFER_BUFFER[i] = 0; }
-        write_sector(DIR_SECTOR, DISK_TRANSFER_BUFFER.as_ptr());
-        print_color(b"FORMATTED DIR\n", 0x0A00);
-    } else if str_eq(cmd, b"LS") {
-        read_sector(DIR_SECTOR, DISK_TRANSFER_BUFFER.as_mut_ptr());
-        let entries = DISK_TRANSFER_BUFFER.as_ptr() as *const FileEntry;
-        let mut found = false;
-        for i in 0..16 {
-            let entry = &*entries.offset(i as isize);
-            if entry.active == 1 {
-                print_str(&entry.name);
-                print_str(b" [READY]\n");
-                found = true;
-            }
-        }
-        if !found { print_str(b"DIR EMPTY\n"); }
-    } else if str_eq(cmd, b"TOUCH") {
-        read_sector(DIR_SECTOR, DISK_TRANSFER_BUFFER.as_mut_ptr());
-        let entries = DISK_TRANSFER_BUFFER.as_mut_ptr() as *mut FileEntry;
-        let mut created = false;
+    // Exit early if no command and not in write mode
+    if COMMAND_LEN == 0 && !in_kwrite { return; }
 
-        for i in 0..16 {
-            let entry = &mut *entries.offset(i as isize);
-            if entry.active == 0 {
-                entry.name = *b"KINGFILE";
-                entry.start_sector = 2050 + i as u32;
-                entry.size = 512;
-                entry.active = 1;
-                created = true;
+    // Use a u16 pointer for ATA PIO operations (word-based)
+    let buffer_u16 = DIR_BUFFER.as_mut_ptr() as *mut u16;
+
+    // --- 1. KWRITE MODE (Persistence Save Logic) ---
+    if in_kwrite {
+        // Load the directory to find the file we are writing to
+        read_sector(DIR_SECTOR, buffer_u16);
+        
+        // Offset by 16 bytes to skip the 'K' magic byte and access entries
+        let entries = (DIR_BUFFER.as_mut_ptr() as usize + 16) as *mut FileEntry;
+        
+        let mut target_sec = 0;
+        for i in 0..15 {
+            let e = &mut *entries.add(i);
+            if e.active == 1 {
+                target_sec = e.start_sector;
+                e.size = COMMAND_LEN as u32; // Update the metadata size
                 break;
             }
         }
 
-        if created {
-            write_sector(DIR_SECTOR, DISK_TRANSFER_BUFFER.as_ptr());
-            print_color(b"FILE CREATED\n", 0x0A00);
+        if target_sec != 0 {
+            // Create a local aligned buffer for the sector write
+            let mut content_block = [0u16; 256];
+            let content_u8 = content_block.as_mut_ptr() as *mut u8;
+            for i in 0..COMMAND_LEN.min(512) { 
+                *content_u8.add(i) = COMMAND_BUFFER[i]; 
+            }
+            
+            // Write actual file content
+            write_sector(target_sec, content_block.as_ptr());
+            io_wait();
+            
+            // Re-write the Directory sector (to save the updated file size)
+            write_sector(DIR_SECTOR, buffer_u16);
+            print_color(b"\n[DISK: SYNCED]", 0x0A00);
         } else {
-            print_color(b"DIR FULL\n", 0x0C00);
+            print_color(b"\n[DISK: ERR - NO ACTIVE FILE]", 0x0C00);
         }
-    } else if str_eq(cmd, b"CLEAR") {
+
+        core::ptr::write_volatile(addr_of_mut!(IN_KWRITE_MODE), false);
+    } 
+    // --- 2. COMMAND DISPATCH ---
+    else if str_eq(cmd, b"HELP") {
+        print_str(b"FETCH, LS, TOUCH, CAT, KWRITE, FORMAT, CLEAR, REBOOT\n");
+    }
+    else if str_eq(cmd, b"FORMAT") {
+        print_str(b"WIPING LBA 2048...");
+        for b in DIR_BUFFER.iter_mut() { *b = 0; }
+        DIR_BUFFER[0] = b'K'; // Set Magic Byte
+        
+        write_sector(DIR_SECTOR, buffer_u16);
+        
+        // Small delay for virtual hardware sync
+        for _ in 0..10000 { asm!("nop"); }
+
+        let mut check = [0u16; 256];
+        read_sector(DIR_SECTOR, check.as_mut_ptr());
+        if (check[0] as u8) == b'K' {
+            print_color(b" SUCCESS\n", 0x0A00);
+        } else {
+            print_color(b" FAIL (DISK READ-ONLY?)\n", 0x0C00);
+        }
+    }
+    else if str_eq(cmd, b"LS") {
+        read_sector(DIR_SECTOR, buffer_u16);
+        let entries = (DIR_BUFFER.as_ptr() as usize + 16) as *const FileEntry;
+        let mut found = false;
+        for i in 0..15 {
+            let e = &*entries.add(i);
+            if e.active == 1 {
+                print_str(&e.name);
+                print_str(b" ["); print_num(e.size, 0x0F00); print_str(b" bytes]\n");
+                found = true;
+            }
+        }
+        if !found { print_str(b"DIR EMPTY\n"); }
+    }
+    else if str_eq(cmd, b"TOUCH") {
+        read_sector(DIR_SECTOR, buffer_u16);
+        let entries = (DIR_BUFFER.as_mut_ptr() as usize + 16) as *mut FileEntry;
+        let mut created = false;
+        for i in 0..15 {
+            let e = &mut *entries.add(i);
+            if e.active == 0 {
+                e.name = *b"MAIN.RS ";
+                e.start_sector = DIR_SECTOR + 1 + i as u32; 
+                e.size = 0;
+                e.active = 1;
+                write_sector(DIR_SECTOR, buffer_u16);
+                print_color(b"CREATED MAIN.RS\n", 0x0A00);
+                created = true;
+                break;
+            }
+        }
+        if !created { print_str(b"DIR FULL\n"); }
+    }
+    else if str_eq(cmd, b"CAT") {
+        read_sector(DIR_SECTOR, buffer_u16);
+        let entries = (DIR_BUFFER.as_ptr() as usize + 16) as *const FileEntry;
+        let (mut sec, mut sz) = (0, 0);
+        for i in 0..15 {
+            let e = &*entries.add(i);
+            if e.active == 1 { 
+                sec = e.start_sector; 
+                sz = e.size; 
+                break; 
+            }
+        }
+        if sec != 0 {
+            read_sector(sec, buffer_u16);
+            let p = DIR_BUFFER.as_ptr();
+            print_color(b"--- CONTENT ---\n", 0x0E00);
+            for i in 0..sz { putchar(*p.add(i as usize)); }
+            print_color(b"\n--- END ---\n", 0x0E00);
+        } else {
+            print_str(b"NO FILE FOUND\n");
+        }
+    }
+    else if str_eq(cmd, b"KWRITE") {
+        print_color(b"WRITE: ", 0x0E00);
+        core::ptr::write_volatile(addr_of_mut!(IN_KWRITE_MODE), true);
+    }
+    else if str_eq(cmd, b"FETCH") {
+        fetch();
+    }
+    else if str_eq(cmd, b"CLEAR") {
         let vga = 0xb8000 as *mut u16;
-        for i in 80..2000 { *vga.offset(i) = DEFAULT_COLOR | b' ' as u16; }
+        for i in 80..2000 { *vga.add(i) = 0x0F00 | b' ' as u16; }
         CURSOR_X = 0; CURSOR_Y = 1;
-    } else if str_eq(cmd, b"REBOOT") {
+    }
+    else if str_eq(cmd, b"REBOOT") {
         let ptr = IdtPtr { limit: 0, base: 0 };
         asm!("lidt [{}]", in(reg) &ptr);
         asm!("int 3");
-    } else {
-        print_str(b"UNKNOWN: "); print_str(cmd); putchar(b'\n');
+    }
+    else {
+        print_str(b"UNKNOWN COMMAND\n");
     }
 
-    COMMAND_LEN = 0;
+    // --- 3. CLEANUP ---
+    for i in 0..64 { unsafe { COMMAND_BUFFER[i] = 0; } }
+    unsafe { COMMAND_LEN = 0; }
 }
 
 // --- INTERRUPTS ---
@@ -256,14 +399,36 @@ fn scancode_to_ascii(scancode: u8) -> u8 {
 }
 
 #[no_mangle] pub unsafe extern "C" fn timer_handler() { TICKS += 1; asm!("mov al, 0x20", "out 0x20, al"); }
-#[no_mangle] pub unsafe extern "C" fn keyboard_handler() {
-    let scancode: u8; asm!("in al, 0x60", out("al") scancode);
+#[no_mangle] 
+
+pub unsafe extern "C" fn keyboard_handler() {
+    let scancode: u8; 
+    asm!("in al, 0x60", out("al") scancode);
+    
+    // Process only key-down events (scancodes below 0x80)
     if scancode < 0x80 {
         let ascii = scancode_to_ascii(scancode);
-        if ascii == b'\n' { putchar(b'\n'); execute_command(); print_str(b"> "); }
-        else if ascii == b'\x08' { if COMMAND_LEN > 0 { COMMAND_LEN -= 1; putchar(b'\x08'); } }
-        else if ascii != 0 && COMMAND_LEN < 64 { COMMAND_BUFFER[COMMAND_LEN] = ascii; COMMAND_LEN += 1; putchar(ascii); }
+        
+        if ascii == b'\n' { 
+            putchar(b'\n'); 
+            // Mark the command as ready for the main loop to pick up
+            core::ptr::write_volatile(addr_of_mut!(COMMAND_READY), true);
+        }
+        else if ascii == b'\x08' { 
+            if COMMAND_LEN > 0 { 
+                COMMAND_LEN -= 1; 
+                putchar(b'\x08'); 
+            } 
+        }
+        else if ascii != 0 && COMMAND_LEN < 64 { 
+            COMMAND_BUFFER[COMMAND_LEN] = ascii; 
+            COMMAND_LEN += 1; 
+            putchar(ascii); 
+        }
     }
+
+    // MANDATORY: Send EOI (End of Interrupt) to the PIC
+    // This tells the hardware "I have handled the key, send the next one."
     asm!("mov al, 0x20", "out 0x20, al");
 }
 
@@ -273,37 +438,83 @@ fn scancode_to_ascii(scancode: u8) -> u8 {
 // --- ENTRY POINT ---
 
 #[no_mangle]
+#[link_section = ".text.stage2_entry"]
 pub extern "C" fn stage2_entry() -> ! {
     unsafe {
+        // --- 1. INITIALIZATION ---
         let vga = 0xb8000 as *mut u16;
         for i in 0..2000 { *vga.offset(i) = DEFAULT_COLOR | b' ' as u16; }
-        let h = b"--- KING OS v0.0.1 ---";
+        let h = b"--- KING OS v0.0.1 (STABLE) ---";
         for (i, &b) in h.iter().enumerate() { *vga.offset(i as isize) = 0x4F00 | b as u16; }
 
-        // 1. HARD RESET ATA CONTROLLER
-        // Writing 0x04 to Control Register resets the bus
+        // ATA Reset
         asm!("out dx, al", in("dx") ATA_CONTROL, in("al") 0x04u8);
         io_wait();
         asm!("out dx, al", in("dx") ATA_CONTROL, in("al") 0x00u8);
         io_wait();
+        select_drive(DIR_SECTOR);
 
-        let t_addr = timer_wrapper as u32; let k_addr = kb_wrapper as u32;
-        IDT[32] = IdtEntry { low: (t_addr & 0xFFFF) as u16, sel: 0x08, res: 0, flags: 0x8E, high: (t_addr >> 16) as u16 };
-        IDT[33] = IdtEntry { low: (k_addr & 0xFFFF) as u16, sel: 0x08, res: 0, flags: 0x8E, high: (k_addr >> 16) as u16 };
-        let ptr = IdtPtr { limit: 2047, base: &IDT as *const _ as u32 };
+        // IDT & PIC Setup
+        let t_addr = timer_wrapper as u32; 
+        let k_addr = kb_wrapper as u32;
+        let idt_ptr_raw = addr_of_mut!(IDT);
+        (*idt_ptr_raw)[32] = IdtEntry { low: (t_addr & 0xFFFF) as u16, sel: 0x08, res: 0, flags: 0x8E, high: (t_addr >> 16) as u16 };
+        (*idt_ptr_raw)[33] = IdtEntry { low: (k_addr & 0xFFFF) as u16, sel: 0x08, res: 0, flags: 0x8E, high: (k_addr >> 16) as u16 };
+        let ptr = IdtPtr { limit: 2047, base: idt_ptr_raw as u32 };
         asm!("lidt [{}]", in(reg) &ptr);
 
+        // Remap PIC
         asm!("mov al, 0x11", "out 0x20, al", "out 0xA0, al");
         asm!("mov al, 0x20", "out 0x21, al", "mov al, 0x28", "out 0xA1, al");
         asm!("mov al, 0x04", "out 0x21, al", "mov al, 0x02", "out 0xA1, al");
         asm!("mov al, 0x01", "out 0x21, al", "out 0xA1, al");
         asm!("mov al, 0xFC", "out 0x21, al", "mov al, 0xFF", "out 0xA1, al");
 
+        // --- 2. DISK PROBE ---
+        let buffer_raw = addr_of_mut!(DISK_TRANSFER_BUFFER) as *mut u16;
+        let mut success = false;
+        for _ in 0..5 {
+            read_sector(DIR_SECTOR, buffer_raw);
+            let status: u8; asm!("in al, dx", out("al") status, in("dx") ATA_COMMAND);
+            if (status & 0x01) == 0 { success = true; break; }
+            for _ in 0..1000000 { asm!("nop"); }
+        }
+
+        if success {
+            let first_byte = core::ptr::read_volatile(buffer_raw as *const u8);
+            if first_byte == b'K' { print_color(b"\nFS: KINGFS DETECTED", 0x0A00); }
+            else { print_color(b"\nFS: READY (RUN FORMAT)", 0x0E00); }
+        } else {
+            print_color(b"\nFS: DRIVE INIT FAILED", 0x0C00);
+        }
+
         print_str(b"\n> ");
-        asm!("sti");
         update_hardware_cursor();
+        
+        // Enable interrupts!
+        asm!("sti");
+
+        // --- 3. THE COMMAND DISPATCHER (THE FIX) ---
+        loop {
+            // We use a "cli/sti" sandwich to check the flag safely
+            asm!("cli"); 
+            if core::ptr::read_volatile(addr_of!(COMMAND_READY)) {
+                asm!("sti"); // Re-enable so we can use the disk/keyboard
+                
+                execute_command();
+                
+                print_str(b"> ");
+                update_hardware_cursor();
+                
+                // Reset the flag
+                core::ptr::write_volatile(addr_of_mut!(COMMAND_READY), false);
+            } else {
+                asm!("sti");
+                // Sleep until the next keyboard interrupt wakes us up
+                asm!("hlt"); 
+            }
+        }
     }
-    loop { unsafe { asm!("hlt"); } }
 }
 
 #[panic_handler] fn panic(_info: &PanicInfo) -> ! { loop {} }
